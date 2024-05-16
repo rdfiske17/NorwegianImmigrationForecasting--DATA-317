@@ -1,0 +1,598 @@
+---
+title: "Final Project: Immigration Forecasting for Norwegian Counties by Global-Region Origin"
+author: "Riley Fiske"
+date: "2023-12-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(fpp3)
+library(readxl)
+library(rvest)
+library(polite)
+```
+
+```{r read_in_data, include=FALSE}
+
+## Load in the data
+
+# municipality, the immigrant count for each Norwegian Municipality yearly
+
+municipality <- read_excel("municipality.xlsx")
+
+municipality <- municipality %>%
+  filter(year >= 1986) %>%
+  rename(immigrantCount = `07108: Immigrants and Norwegian-born to immigrant parents, by region, sex, country background, year and contents`,
+         countryBackground = `country background`) %>%
+  group_by(region,countryBackground, year) %>%
+  summarise(immigrantCount = sum(immigrantCount)) %>%
+  ungroup()
+
+# populations, the population count for each Norwegian Municipality yearly
+
+populations <- read_excel("populations.xlsx") %>%
+  rename(population = `07459: Population, by region, year and contents`) %>%
+  filter(year >= 1986)
+
+total_pops <- populations %>%
+  aggregate(population ~ year, sum)
+
+# municipalities_wiki, webscraper pulling county assignments for each municipality from wikipedia table
+# tutorial from https://www.r-bloggers.com/2021/07/politely-scraping-wikipedia-tables-2/, knew it existed from Data Mining :)
+
+url <- "https://en.wikipedia.org/wiki/List_of_municipalities_of_Norway"
+
+url_bow <- bow(url)
+
+ind_html <- scrape(url_bow) %>%
+  html_nodes("table.wikitable") %>%
+  html_table(fill = TRUE)
+
+municipalities_wiki <- ind_html[[1]]
+
+municipalities_wiki <- municipalities_wiki %>%
+  rename(number = `Number[8](ISO 3166-2:NO)`) %>%
+  mutate(number = case_when(number >= 1000 ~ as.character(number), number < 1000 ~ paste0("0",as.character(number)), .default = as.character(number))) %>%
+  mutate(region = paste0("K-",number, " ", Name)) %>%
+  select(County,region)
+
+#write.csv(municipalities_wiki, "municipalities_wiki.csv") # just encase the website gets changed. Uncomment this line and read this in rather than the previous several lines
+
+# join municipality data to county wikipedia table, create tsibble
+
+county_immigrants <- left_join(municipality, municipalities_wiki, by = "region") %>%
+  mutate(region = as.factor(region)) %>%
+  mutate(County = case_when(region == "K-1515 Herøy (Møre og Romsdal)" ~ "Møre og Romsdal",
+                            region == "K-1818 Herøy (Nordland)" |
+                              region == "K-1818 Herøy (Nordland)" |
+                              region == "K-1841 Fauske - Fuosko" |
+                              region == "K-1853 Evenes - Evenássi" |
+                              region == "K-1870 Sortland - Suortá" |
+                              region == "K-1875 Hamarøy" ~ "Nordland",
+                            region == "K-21-22 Svalbard and Jan Mayen" |
+                              region == "K-23 Continental shelf" |
+                              region == "K-Rest Divided municalities and unknown" ~ "Territories & Unknown",
+                            region == "K-3018 Våler (Østfold)" ~ "Viken",
+                            region == "K-3419 Våler (Hedmark)" ~ "Innlandet",
+                            region == "K-5001 Trondheim - Tråante" |
+                              region == "K-5006 teinkj" |
+                              region == "K-5025 Røros - Rosse" |
+                              region == "K-5041 Snåase - Snåsa" |
+                              region == "K-5043 Raarvihke - Røyrvik" ~ "Trøndelag",
+                            region == "K-5415 Loabák - Lavangen" |
+                              region == "K-5425 Storfjord - Omasvuotna - Omasvuono" |
+                              region == "K-5426 Gáivuotna - Kåfjord - Kaivuono" |
+                              region == "K-5430 Guovdageaidnu - Kautokeino" |
+                              region == "K-5436 Porsanger - Porsángu - Porsanki " |
+                              region == "K-5437 Kárásjohka - Karasjok" |
+                              region == "K-5441 Deatnu - Tana" |
+                              region == "K-5442 Unjárga - Nesseby" ~ "Troms og Finnmark",
+                           .default = County)) %>%
+  mutate(County = as.factor(County)) %>%
+  group_by(countryBackground, County, year) %>%
+  summarise(immigrantCount = sum(immigrantCount)) %>%
+  filter(countryBackground != "8 Stateless" & countryBackground != "9 Uoppgitt") %>%
+  filter(County != "Territories & Unknown") %>%
+  mutate(countryBackground = as.factor(countryBackground)) %>%
+  droplevels() %>%
+  as_tsibble(index = year, key = c("County","countryBackground"))
+
+# aggregate keys
+
+immigrants_hts <- county_immigrants %>%
+  aggregate_key(County / countryBackground, immigrantCount = sum(immigrantCount))
+
+# join hts with total_pops and create standardized variable
+
+immigrants_hts <- left_join(immigrants_hts, total_pops, by = "year") %>%
+  mutate(immigrant_nationalproportion = immigrantCount / population)
+
+# create aggregate-only datatable for visualizations
+
+immigrants_hts_agg <- immigrants_hts %>%
+  filter(is_aggregated(County) & is_aggregated(countryBackground))
+
+# oofda, all the setup is done...
+```
+
+## Introduction
+
+    
+  The world is more interconnected today than it ever has been, and as a result, immigration rates in most countries are on the incline as people get out and settle the world. This is certainly true for most first world countries as immigrants from countries of less economic stature seek better working conditions, safer places to raise their families, or are escaping conflict or hardship in their own countries.
+
+    
+  Destinations such as The United States of America, Canada, Australia, New Zealand, countries in Western Europe, and other economically sound countries are particularly appealing to immigrants, and this report will be centered around the immigration into Norway. Norway is a quite economically strong country, has a beautiful landscape, and has one of the happiest populations in the world, so it is no surprise that immigrants are flocking to this northern paradise.
+
+    
+  [[The Statistics Center of Norway (Statistisk sentralbyrå)]{.underline}](https://www.ssb.no/en) releases publicly accessible statistics about the country, and they have been releasing immigration data into different Norwegian municipalities since 1986. Using these datasets, one can assemble forecasting models to predict immigrant counts into each of these municipalities. This is particularly interesting to me due to my fascination with the country. Norway is very near and dear to my heart as someone who identifies closely with my cultural heritage. I have toyed with the idea of moving there post-graduation for further studies or to simply live life, which is why studying immigration to Norway peaks my interest. Forecasting these counts is also interesting for those in the Norwegian Government so they can properly plan for the influx of immigrants from different parts of the world (Europe, Africa, Asia, North America, Latin America, Oceania) and have systems prepared for those coming from different types of cultures since different people often have different needs.
+  
+    
+  In this analysis, we will be forecasting standardized immigration rates to Norwegian Counties using a Hierarchical Time Series by minimizing test statistics for different inner models (ARIMA and ETS) and outer models (Bottom-Up, Top-Down, Middle-Out, and Minimum Trace). Then, we will use the best models to create forecasts and confidence intervals for the next several years and show graphics explain the implications of the generated forecasts.
+  
+## The Data
+
+    
+  Before getting to create any models, we must manipulate the dataset to be formatted properly for the desired outcome. To create a hierarchical model from the data, one must first think about what this hierarchical structure will look like. The dataset from The Statistics Center of Norway contained data for 359 municipalities, 9 geographical immigrants origin regions, and male/female sex. To simplify the model, the 359 municipalities were condensed into their respective counties, the Norwegian equivalent to a state in the US, the two sex factors were combined to eliminate a layer from the hierarchy, and of the 9 geographical immigrant origin regions, only 6 actually had non-zero data. This scaled the dataset down to information for 11 counties and 6 origin regions, a much more reasonable number for model creation and analysis.
+
+    
+  Additionally, a small transformation to the data must be considered. Since the population of the world and the country of Norway changes overtime, the count of immigrants coming in depends on the fluctuation of population. Therefore, we will be analyzing a proportion instead of the actual number of immigrants. This will be controlled by the yearly population of the country as follows:
+
+$$
+StandardizedImmigrantRate_{year} = \frac{NumberOfImmigrants_{year}}{PopulationOfNorway_{year}}
+$$
+
+```{r national_immigration_graph, echo = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+immigrants_hts_agg %>%
+  autoplot(immigrant_nationalproportion) + labs(title = "Standardized Immigration Rate in Norway per Year", x = "Year", y = "Proportion of Immigrants in National Population")
+
+```
+
+    
+  As can be seen in the above figure, the percentage of the population of Norway that is made up of immigrants is on the incline and has consistently been since the start of the data collection. This will inform our selection of models to use in the steps to come.
+  
+```{r immigration_per_county_graph, echo = FALSE, fig.dim = c(10,4), fig.align = 'center'}
+
+immigrants_hts %>%
+  filter(!is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot(immigrant_nationalproportion) +
+  facet_wrap(.~County, ncol = 4, scales = "free_y") + labs(title = "Standardized Immigration Rate in Norwegian Counties per Year", x = "Year", y = "Proportion of Immigrants in National Population") + theme(legend.position = "none")
+
+```
+
+    
+  If this rate is broken down by each County, aggregated for origin-region, this trend of positive growth is also quite clear. The only observable dips in growth are around 2020-2021 in a few counties, which should be expected due to the global pandemic in these years. 
+
+``` {r county_specific_graphs, echo = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+immigrants_hts %>%
+  filter(County == "Troms og Finnmark", !is_aggregated(countryBackground)) %>%
+  autoplot(immigrant_nationalproportion) + labs(title = "Standardized Immigration Rate for Troms og Finnmark per Year", x = "Year", y = "Proportion of Immigrants in National Population")
+
+immigrants_hts %>%
+  filter(County == "Oslo", !is_aggregated(countryBackground)) %>%
+  autoplot(immigrant_nationalproportion) + labs(title = "Standardized Immigration Rate for Oslo per Year", x = "Year", y = "Proportion of Immigrants in National Population")
+
+```
+
+    
+  At the county level, insights on the origin-region composition can also be seen. One can see that counties will have different compositions as Oslo's immigrant population is mainly composed of immigrants from Asia and Europe while Troms og Finnmark's immigrant population is dominated by European background immigrants.
+  
+    
+  From here, we will begin to dive into models that capture these nested trends.
+  
+## Background Information on Hierarchical Models, ARIMA Models, and Exponential Smoothing Models with Trend
+
+    
+  Firstly, a little background is necessary on the models that will be used. Hierarchical models are built upon relationships between variable levels and can take the form of predicting a higher level from the sum of the lower levels, predicting the values of the lower levels from proportions of the upper level, starting in the middle and building up and down, or using more advanced methods that require an understanding of linear algebra.
+  
+    
+  When creating these hierarchical models, we begin by choosing a model to capture the trend of each combination of county and origin-region. Then, we specify a reconciliation of these models with different hierarchical approaches: a top-down approach, meaning the data on the lower levels is explained by the model of the upper-most level, a bottom-up approach, meaning the data on the upper levels is explained by the sum of the models of the lower-most levels working up, a middle-out approach, which begins at a level in the middle and works up using a bottom-up approach and works down using a top-down approach, or the minimum trace model.
+  
+    
+  For the models that will be used to implement the top-down, bottom-up, middle-out, and minimum trace hierarchical practices, we will be testing ARIMA models against exponential smoothing models with trend. Exponential smoothing models are similar to the drift method, which was used in the first project, but rather than only using the first and last points to form the model, all points are used with weights to emphasize the importance of recent observations and weaken the impact of long-past observations when forming forecasts. Two types of exponential smoothing models will be used: Holt's Linear Trend Method, and the Damped Holt Method.
+
+    
+  Holt's Linear Trend Method extends the traditional exponential smoothing model to account for linearity in data. The dataset is generally linear, as seen in the previous graphs, so this method is a prime candidate for capturing the trend. The Damped Holt Method extends Holt's Linear Trend Method but accounts for the fact that Holt's Method often overestimates into the long-term, so the further out the forecast, the more it is dampened.
+  
+    
+  ARIMA models will be the first model to be tested as a base for the different hierarchical models. ARIMA models use a combination of autoregession, differencing, and moving averages of data to generate models. ARIMA models are extremely powerful when tuned correctly.
+  
+## ARIMA Modeling as the Base of a Hierarchical Model
+
+    
+  The ARIMA models generated were generated independently for each combination of county and origin-region, meaning the coefficients for the autoregressive, differencing, and moving average components may be different for each combination. For this reason, it would be overbearing to go through and manually optimize the coefficients for each of the ARIMA models, and the coefficients selected by R for each will be used.
+
+```{r arima_model, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+arima_immigrant_model <- immigrants_hts %>%
+  model(Arima = ARIMA(immigrant_nationalproportion)) %>%
+  reconcile(`Bottom-Up` = bottom_up(Arima),
+            `Top-Down` = top_down(Arima, method = "forecast_proportions"),
+            `Middle-Out` = middle_out(Arima, split = 1),
+            `Minimum-Trace` = min_trace(Arima, method = "ols"))
+
+arima_fc <- arima_immigrant_model %>%
+  forecast(h = 8)
+
+arima_immigrant_model %>% augment() %>%
+  filter(is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot(.fitted) +
+  autolayer(immigrants_hts_agg,immigrant_nationalproportion, alpha = 0.5) +
+    facet_wrap(vars(.model), scales = "free_y") + labs(title = "Standardized Immigration Rate to Norway per Year (ARIMA Model Base)", x = "Year", y = "Proportion of Immigrants in National Population") + theme(legend.position = "none")
+
+arima_fc %>% filter(is_aggregated(County) & is_aggregated(countryBackground)) %>%
+  autoplot() +
+    autolayer(immigrants_hts_agg,immigrant_nationalproportion) +
+    facet_wrap(vars(.model), scales = "free_y") + labs(title = "Forecast of Standardized Immigration Rate to Norway per Year (ARIMA Model Base)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+# arima_fc %>% filter(County == "Oslo") %>%
+#   autoplot() +
+#     autolayer(immigrants_hts %>% filter(County == "Oslo"),immigrant_nationalproportion) +
+#     facet_wrap(vars(.model), scales = "free_y") + labs(title = "Forecast of Standardized Immigration Rate in Oslo per Year (ARIMA Model Base)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+```
+    
+  The first visual shows the generated models on top of the actual data aggregated. All five models follow the trend quite well, and moving to the visual including forecasts is where the difference in models begins to show up. The confidence intervals widen and shrink dependent on which hierarchical technique was used. For the comparison between the different inner-models, we will be using training-and-testing sets to generate test statistics.
+
+    
+  Training and Testing Sets are used by partitioning the data into two parts, usually an 80-20 split favoring the training set. The training set is used to create a model and forecasts will be compared against the testing set to see how the training set did at predicting the test set. Again, on the aggregated scale, here is a visualization of how it did and a table of the RMSE (Root Mean Squared Error) and the MAE (Mean Absolute Error) for each model:
+  
+```{r arima_train_test, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+training_num <- floor(length(unique(immigrants_hts$year)) * 0.8)
+
+testing_num <- length(unique(immigrants_hts$year)) - training_num
+
+last_training_year <- unique(immigrants_hts$year)[training_num]
+
+training_immigrants <- immigrants_hts %>% filter(year <= last_training_year)
+
+testing_immigrants <- immigrants_hts %>% filter(year > last_training_year)
+
+arima_test_fc <- training_immigrants %>%
+  model(Arima = ARIMA(immigrant_nationalproportion)) %>%
+  reconcile(`Bottom-Up` = bottom_up(Arima),
+            `Top-Down` = top_down(Arima, method = "forecast_proportions"),
+            `Middle-Out` = middle_out(Arima, split = 1),
+            `Minimum-Trace` = min_trace(Arima, method = "ols")) %>%
+  forecast(h = testing_num)
+
+arima_test_fc %>% filter(is_aggregated(County), is_aggregated(countryBackground)) %>% autoplot(training_immigrants %>% filter(is_aggregated(County), is_aggregated(countryBackground))) +
+  autolayer(testing_immigrants %>% filter(is_aggregated(County), is_aggregated(countryBackground)),immigrant_nationalproportion) + facet_wrap(vars(.model), scales = "free_y") + labs(title = "Standardized Immigration Rate to Norway per Year Forecasts vs. Actual (ARIMA Model Base)", x = "Year", y = "Proportion of Immigrants in National Population") + theme(legend.position = "none")
+
+arima_stats_table <- arima_test_fc %>%
+  accuracy(data = testing_immigrants, measures = list(rmse = RMSE, mae = MAE)) %>%
+  group_by(.model) %>%
+  summarize(rmse = mean(rmse), mae = mean(mae)) %>%
+  rename(Model = .model, RMSE = rmse, MAE = mae)
+
+knitr::kable(arima_stats_table, format = "simple", align = "c", caption = "Accuracy Statistic Values for Forecasting Models using Testing/Training Sets and ARIMA as a Hierarchical Base")
+
+```
+
+    
+  It appears that, once again, all of the models are performing quite similarly. Technically, it appears that the Top-Down model is minimizing both the RMSE and the MAE, but not by a significant amount. In most analyses, one could also perform cross-validation and acquire accuracy statistics from that, however cross-validation does not seem to work with hierarchical structures for whatever reason. In any case, perhaps upon analysis of the exponential smoothing models we will find a better candidate.
+  
+## Holt's Linear Trend Model as the Base of a Hierarchical Model
+
+    
+  Earlier, we mentioned the linear trend that the data seemed to be observing. Let us see if Holt's model can capture this better than ARIMA can:
+
+```{r holt_model, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+holt_immigrant_model <- immigrants_hts %>%
+  model(Holt = ETS(immigrant_nationalproportion ~ error("A") + trend("A") + season("N"))) %>%
+  reconcile(`Bottom-Up` = bottom_up(Holt),
+            `Top-Down` = top_down(Holt, method = "forecast_proportions"),
+            `Middle-Out` = middle_out(Holt, split = 1),
+            `Minimum-Trace` = min_trace(Holt, method = "ols"))
+
+holt_fc <- holt_immigrant_model %>%
+  forecast(h = 8)
+
+holt_immigrant_model %>% augment() %>%
+  filter(is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot(.fitted) +
+  autolayer(immigrants_hts_agg,immigrant_nationalproportion, alpha = 0.5) +
+    facet_wrap(vars(.model), scales = "free_y") + labs(title = "Standardized Immigration Rate to Norway per Year (Holt Model Base)", x = "Year", y = "Proportion of Immigrants in National Population") + theme(legend.position = "none")
+
+holt_fc %>% filter(is_aggregated(County) & is_aggregated(countryBackground)) %>%
+  autoplot() +
+    autolayer(immigrants_hts_agg,immigrant_nationalproportion) +
+    facet_wrap(vars(.model), scales = "free_y") + labs(title = "Forecast of Standardized Immigration Rate to Norway per Year (Holt Model Base)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+```
+
+    
+  As expected, the Holt Model forecasts a near-straight increasing line for all the models. The models appear to follow the data well. A glance at a comparison to the test set should show us more of what is going on:
+
+```{r holt_test_train, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+holt_test_fc <- training_immigrants %>%
+  model(Holt = ETS(immigrant_nationalproportion ~ error("A") + trend("A") + season("N"))) %>%
+  reconcile(`Bottom-Up` = bottom_up(Holt),
+            `Top-Down` = top_down(Holt, method = "forecast_proportions"),
+            `Middle-Out` = middle_out(Holt, split = 1),
+            `Minimum-Trace` = min_trace(Holt, method = "ols")) %>%
+  forecast(h = testing_num)
+
+holt_test_fc %>% filter(is_aggregated(County), is_aggregated(countryBackground)) %>% autoplot(training_immigrants %>% filter(is_aggregated(County), is_aggregated(countryBackground))) +
+  autolayer(testing_immigrants %>% filter(is_aggregated(County), is_aggregated(countryBackground)),immigrant_nationalproportion) + facet_wrap(vars(.model), scales = "free_y") + labs(title = "Standardized Immigration Rate to Norway per Year Forecasts vs. Actual (Holt Model Base)", x = "Year", y = "Proportion of Immigrants in National Population") + theme(legend.position = "none")
+
+holt_stats_table <- holt_test_fc %>%
+  accuracy(data = testing_immigrants, measures = list(rmse = RMSE, mae = MAE)) %>%
+  group_by(.model) %>%
+  summarize(rmse = mean(rmse), mae = mean(mae)) %>%
+  rename(Model = .model, RMSE = rmse, MAE = mae)
+
+knitr::kable(holt_stats_table, format = "simple", align = "c", caption = "Accuracy Statistic Values for Forecasting Models using Testing/Training Sets and Holt as a Hierarchical Base")
+
+```
+
+    
+  In some cases, Holt's model performs worse than ARIMA, however. we have also found our best performing model yet in the Top-Down Model with a Holt base in terms of minimizing RMSE and MAE. When looking at the plot of testing data vs. forecasts, it can be seen that the entirety of the testing data is encapsulated within the confidence intervals of the Top-Down Method, riding the border between 80 and 95% confident.
+
+## Damped Holt's Linear Trend Model as the Base of a Hierarchical Model
+
+    
+  The initial plot of the standardized immigration rate aggregated showed that there was a larger rise in the rate in the last recorded year. This may be causing predictions to be higher than they should be. The Damped Holt's Method dampens forecasts as they get further out, so it should perform quite well.
+
+```{r damped_holt_model, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+damped_holt_immigrant_model <- immigrants_hts %>%
+  model(Damped_Holt = ETS(immigrant_nationalproportion ~ error("A") + trend("Ad") + season("N"))) %>%
+  reconcile(`Bottom-Up` = bottom_up(Damped_Holt),
+            `Top-Down` = top_down(Damped_Holt, method = "forecast_proportions"),
+            `Middle-Out` = middle_out(Damped_Holt, split = 1),
+            `Minimum-Trace` = min_trace(Damped_Holt, method = "ols"))
+
+damped_holt_fc <- damped_holt_immigrant_model %>%
+  forecast(h = 8)
+
+damped_holt_immigrant_model %>% augment() %>%
+  filter(is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot(.fitted) +
+  autolayer(immigrants_hts_agg,immigrant_nationalproportion, alpha = 0.5) +
+    facet_wrap(vars(.model), scales = "free_y") + labs(title = "Standardized Immigration Rate to Norway per Year (Damped Holt Model Base)", x = "Year", y = "Proportion of Immigrants in National Population") + theme(legend.position = "none")
+
+damped_holt_fc %>% filter(is_aggregated(County) & is_aggregated(countryBackground)) %>%
+  autoplot() +
+    autolayer(immigrants_hts_agg,immigrant_nationalproportion) +
+    facet_wrap(vars(.model), scales = "free_y") + labs(title = "Forecast of Standardized Immigration Rate to Norway per Year (Damped Holt Model Base)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+```
+
+    
+  The first noticeable difference is the shape of the forecast line: it's curved. This is different from the previous models we have seen, and the accuracy statistics will show that this is in fact a good inclusion.
+
+```{r damped_holt_test_train, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+damped_holt_test_fc <- training_immigrants %>%
+  model(Damped_Holt = ETS(immigrant_nationalproportion ~ error("A") + trend("Ad") + season("N"))) %>%
+  reconcile(`Bottom-Up` = bottom_up(Damped_Holt),
+            `Top-Down` = top_down(Damped_Holt, method = "forecast_proportions"),
+            `Middle-Out` = middle_out(Damped_Holt, split = 1),
+            `Minimum-Trace` = min_trace(Damped_Holt, method = "ols")) %>%
+  forecast(h = testing_num)
+
+damped_holt_test_fc %>% filter(is_aggregated(County), is_aggregated(countryBackground)) %>% autoplot(training_immigrants %>% filter(is_aggregated(County), is_aggregated(countryBackground))) +
+  autolayer(testing_immigrants %>% filter(is_aggregated(County), is_aggregated(countryBackground)),immigrant_nationalproportion) + facet_wrap(vars(.model), scales = "free_y") + labs(title = "Standardized Immigration Rate to Norway per Year Forecasts vs. Actual (Damped Holt Model Base)", x = "Year", y = "Proportion of Immigrants in National Population") + theme(legend.position = "none")
+
+damped_holt_stats_table <- damped_holt_test_fc %>%
+  accuracy(data = testing_immigrants, measures = list(rmse = RMSE, mae = MAE)) %>%
+  group_by(.model) %>%
+  summarize(rmse = mean(rmse), mae = mean(mae)) %>%
+  rename(Model = .model, RMSE = rmse, MAE = mae)
+
+knitr::kable(damped_holt_stats_table, format = "simple", align = "c", caption = "Accuracy Statistic Values for Forecasting Models using Testing/Training Sets and Damped Holt as a Hierarchical Base")
+
+```
+
+    
+  In the traditional Holt Model, we saw Top-Down minimize RMSE and MAE at 0.0005164 and 0.0004454 respectively. We have a new minimum, and by a significant margin. The Bottom-Up Method using the Damped Holt Model achieved an RMSE of 0.0004368 and an MAE of 0.0003790. This numerically clearly minimizes those two accuracy statistics, but given the nature of how the statistics were generated (averaging the RMSE's and MAE's of all the key combinations), a few outliers could be pulling the data for certain models out far. The visuals show us how well the Top-Down Method, Minimum-Trace, and Middle-Out all performed with the Damped Holt Model.
+  
+    
+  The test statistics and visuals for this method all appear to be the strongest of the three inner-methods attempted, so we will continue our analysis with all outer-methods utilizing the Damped Holt Model.
+  
+## Residual Analysis
+
+    
+  Similarly to how cross-validation does not work great with hierarchical models, analyzing the residuals is also quite complex as it would involve an independent analysis of each model and submodel since they're independently tailored. In the examples provided in the book about hierarchical model analysis, they focus on utilizing training-and-testing sets with accuracy statistics to choose best models, so we will follow that pattern here, skip the residual analysis, and hop right into creating full forecasts and confidence intervals, discuss their differences, and finish by showing a few predictions for individual counties as to not lose the focus of the project on different county and origin-regions of immigrants coming to Norway.
+  
+## Forecasting and Creating Confidence Intervals
+
+    
+  We will generate short and long term forecasts using the Damped Holt Model and compare and contrast the forecasts generated for each of the Hierarchical Methods used.
+  
+### Bottom-Up
+
+    
+  The Bottom-Up Hierarchical Model was the strongest performing model produced in terms of the accuracy statistics we generated.
+  
+```{r bu_forecasts, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+bu_fc <- damped_holt_immigrant_model %>% select(County,countryBackground,`Bottom-Up`) %>%
+  forecast(h = 8)
+
+bu_fc %>% filter(is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot() +
+    autolayer(immigrants_hts_agg, immigrant_nationalproportion) + labs(title = "Forecasted Standardized Immigration Rate in Norway per Year (Bottom-Up)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+bu_hilo <- bu_fc %>% hilo() %>% filter(is_aggregated(County), is_aggregated(countryBackground))
+
+decimal_num <- 5
+start_year_index <- 1
+middle_year_index <- 4
+end_year_index <- 8
+
+bu_table <- data.frame(
+  Year = c(bu_hilo$year[start_year_index],bu_hilo$year[middle_year_index],bu_hilo$year[end_year_index]),
+  Low80 = c(round(bu_hilo$`80%`[start_year_index]$lower, decimal_num),
+            round(bu_hilo$`80%`[middle_year_index]$lower, decimal_num),
+            round(bu_hilo$`80%`[end_year_index]$lower, decimal_num)),
+  Upper80 = c(round(bu_hilo$`80%`[start_year_index]$upper, decimal_num),
+            round(bu_hilo$`80%`[middle_year_index]$upper, decimal_num),
+            round(bu_hilo$`80%`[end_year_index]$upper, decimal_num)),
+  Low95 = c(round(bu_hilo$`95%`[start_year_index]$lower, decimal_num),
+            round(bu_hilo$`95%`[middle_year_index]$lower, decimal_num),
+            round(bu_hilo$`95%`[end_year_index]$lower, decimal_num)),
+  Upper95 = c(round(bu_hilo$`95%`[start_year_index]$upper, decimal_num),
+            round(bu_hilo$`95%`[middle_year_index]$upper, decimal_num),
+            round(bu_hilo$`95%`[end_year_index]$upper, decimal_num)))
+
+knitr::kable(bu_table, format = "simple", align = "c", caption = "Confidence Interval Lower-Upper Bounds for Bottom-Up Damped Holt Forecasts")
+
+```
+
+### Middle-Out
+
+    
+  Middle-Out looks to have a smaller confidence band, like Bottom-Up, but performed slightly poorer than Bottom-Up.
+  
+```{r mo_forecasts, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+mo_fc <- damped_holt_immigrant_model %>% select(County,countryBackground,`Middle-Out`) %>%
+  forecast(h = 8)
+
+mo_fc %>% filter(is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot() +
+    autolayer(immigrants_hts_agg, immigrant_nationalproportion) + labs(title = "Forecasted Standardized Immigration Rate in Norway per Year (Middle-Out)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+mo_hilo <- mo_fc %>% hilo() %>% filter(is_aggregated(County), is_aggregated(countryBackground))
+
+# decimal_num <- 5
+# start_year_index <- 1
+# middle_year_index <- 4
+# end_year_index <- 8
+
+mo_table <- data.frame(
+  Year = c(mo_hilo$year[start_year_index],mo_hilo$year[middle_year_index],mo_hilo$year[end_year_index]),
+  Low80 = c(round(mo_hilo$`80%`[start_year_index]$lower, decimal_num),
+            round(mo_hilo$`80%`[middle_year_index]$lower, decimal_num),
+            round(mo_hilo$`80%`[end_year_index]$lower, decimal_num)),
+  Upper80 = c(round(mo_hilo$`80%`[start_year_index]$upper, decimal_num),
+            round(mo_hilo$`80%`[middle_year_index]$upper, decimal_num),
+            round(mo_hilo$`80%`[end_year_index]$upper, decimal_num)),
+  Low95 = c(round(mo_hilo$`95%`[start_year_index]$lower, decimal_num),
+            round(mo_hilo$`95%`[middle_year_index]$lower, decimal_num),
+            round(mo_hilo$`95%`[end_year_index]$lower, decimal_num)),
+  Upper95 = c(round(mo_hilo$`95%`[start_year_index]$upper, decimal_num),
+            round(mo_hilo$`95%`[middle_year_index]$upper, decimal_num),
+            round(mo_hilo$`95%`[end_year_index]$upper, decimal_num)))
+
+knitr::kable(mo_table, format = "simple", align = "c", caption = "Confidence Interval Lower-Upper Bounds for Middle-Out Damped Holt Forecasts")
+
+```
+
+### Minimum-Trace
+
+    
+  The Minimum-Trace Hierarchical Model is admittedly a little foreign to me still, but it performed well in accuracy statistics and in the plot.
+  
+```{r mint_forecasts, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+mint_fc <- damped_holt_immigrant_model %>% select(County,countryBackground,`Minimum-Trace`) %>%
+  forecast(h = 8)
+
+mint_fc %>% filter(is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot() +
+    autolayer(immigrants_hts_agg, immigrant_nationalproportion) + labs(title = "Forecasted Standardized Immigration Rate in Norway per Year (Minimum-Trace)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+mint_hilo <- mint_fc %>% hilo() %>% filter(is_aggregated(County), is_aggregated(countryBackground))
+
+# decimal_num <- 5
+# start_year_index <- 1
+# middle_year_index <- 4
+# end_year_index <- 8
+
+mint_table <- data.frame(
+  Year = c(mint_hilo$year[start_year_index],mint_hilo$year[middle_year_index],mint_hilo$year[end_year_index]),
+  Low80 = c(round(mint_hilo$`80%`[start_year_index]$lower, decimal_num),
+            round(mint_hilo$`80%`[middle_year_index]$lower, decimal_num),
+            round(mint_hilo$`80%`[end_year_index]$lower, decimal_num)),
+  Upper80 = c(round(mint_hilo$`80%`[start_year_index]$upper, decimal_num),
+            round(mint_hilo$`80%`[middle_year_index]$upper, decimal_num),
+            round(mint_hilo$`80%`[end_year_index]$upper, decimal_num)),
+  Low95 = c(round(mint_hilo$`95%`[start_year_index]$lower, decimal_num),
+            round(mint_hilo$`95%`[middle_year_index]$lower, decimal_num),
+            round(mint_hilo$`95%`[end_year_index]$lower, decimal_num)),
+  Upper95 = c(round(mint_hilo$`95%`[start_year_index]$upper, decimal_num),
+            round(mint_hilo$`95%`[middle_year_index]$upper, decimal_num),
+            round(mint_hilo$`95%`[end_year_index]$upper, decimal_num)))
+
+knitr::kable(mint_table, format = "simple", align = "c", caption = "Confidence Interval Lower-Upper Bounds for Minimum-Trace Damped Holt Forecasts")
+
+```
+
+### Top-Down
+
+    
+  The strongest model in the Holt Model and ARIMA Model sections, the Top-Down model struggled the most accuracy-statistic-wise for the Damped Holt Model, but its wide confidence interval contained the entirety of the testing data.
+  
+```{r td_forecasts, echo = FALSE, warning = FALSE, fig.dim = c(8,4), fig.align = 'center'}
+
+td_fc <- damped_holt_immigrant_model %>% select(County,countryBackground,`Top-Down`) %>%
+  forecast(h = 8)
+
+td_fc %>% filter(is_aggregated(County), is_aggregated(countryBackground)) %>%
+  autoplot() +
+    autolayer(immigrants_hts_agg, immigrant_nationalproportion) + labs(title = "Forecasted Standardized Immigration Rate in Norway per Year (Top-Down)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+td_hilo <- td_fc %>% hilo() %>% filter(is_aggregated(County), is_aggregated(countryBackground))
+
+# decimal_num <- 5
+# start_year_index <- 1
+# middle_year_index <- 4
+# end_year_index <- 8
+
+td_table <- data.frame(
+  Year = c(td_hilo$year[start_year_index],td_hilo$year[middle_year_index],td_hilo$year[end_year_index]),
+  Low80 = c(round(td_hilo$`80%`[start_year_index]$lower, decimal_num),
+            round(td_hilo$`80%`[middle_year_index]$lower, decimal_num),
+            round(td_hilo$`80%`[end_year_index]$lower, decimal_num)),
+  Upper80 = c(round(td_hilo$`80%`[start_year_index]$upper, decimal_num),
+            round(td_hilo$`80%`[middle_year_index]$upper, decimal_num),
+            round(td_hilo$`80%`[end_year_index]$upper, decimal_num)),
+  Low95 = c(round(td_hilo$`95%`[start_year_index]$lower, decimal_num),
+            round(td_hilo$`95%`[middle_year_index]$lower, decimal_num),
+            round(td_hilo$`95%`[end_year_index]$lower, decimal_num)),
+  Upper95 = c(round(td_hilo$`95%`[start_year_index]$upper, decimal_num),
+            round(td_hilo$`95%`[middle_year_index]$upper, decimal_num),
+            round(td_hilo$`95%`[end_year_index]$upper, decimal_num)))
+
+knitr::kable(td_table, format = "simple", align = "c", caption = "Confidence Interval Lower-Upper Bounds for Top-Down Damped Holt Forecasts")
+
+```
+
+## Observations, Conclusion, Future Work, and A Few Visuals
+
+    
+  As one moves through the four models just highlighted, you can see and compute that the confidence intervals increase in size going from Bottom-Up to Top-Down. This is due to how the models are computed; Bottom-Up models take the predictions on the bottom and sum them to get to the top. While there are many model intervals to sum to get to the top, they are so small at the bottom that the interval ends up being smaller at the top than if the computation were to have started up there. It follows that Middle-Out would be between the sizes of Bottom-Up and Top-Bottom since it begins in the middle and enacts both procedures.
+  
+```{r extra_vis_1, echo = FALSE, warning = FALSE, fig.dim = c(10,4), fig.align = 'center'}
+
+damped_holt_fc %>% filter(County == "Nordland", .model == "Bottom-Up") %>%
+  autoplot() +
+  autolayer(immigrants_hts %>% filter(County == "Nordland"), immigrant_nationalproportion) + facet_wrap(vars(.model), scales = "free_y") + labs(title = "Forecasted Standardized Immigration Rate in Nordland per Year per Origin-Region (Bottom-Up)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+```
+
+    
+  As I wrap up this exploration, I reflect upon the complexities that are within hierarchical models. I enjoyed our brief introduction to them in class and was excited to delve into them for this project. While I learned even more about them and furthered my understanding regarding ARIMA and ETS models as well, I sense I have barely scratched the surface when it comes to what hierarchical models can do and the fine-tuning that goes into modifying and analyzing them.
+
+```{r extra_vis_2, echo = FALSE, warning = FALSE, fig.dim = c(10,4), fig.align = 'center'}
+
+damped_holt_fc %>% filter(County == "Vestfold og Telemark", .model == "Middle-Out") %>%
+  autoplot() +
+  autolayer(immigrants_hts %>% filter(County == "Vestfold og Telemark"), immigrant_nationalproportion) + facet_wrap(vars(.model), scales = "free_y") + labs(title = "Forecasted Standardized Immigration Rate in Vestfold og Telemark per Year per Origin-Region (Middle-Out)", x = "Year", y = "Proportion of Immigrants in National Population")
+
+```
+
+    
+  If I had more time to put into this project, I would further explore what goes into making a minimum trace model and other MinT approaches. I would further research ways to craftily analyze residuals in a hierarchical context as my brief searches did not lead to much success. I would also like to explore a different way to standardize the data since everything was simply divided by the nation's population in the given year. This seemed like the simplest and most intuitive way to do it, but I sense there are other ways that may work better and lead to less small numbers that I have been using to create predictions.
+  
+    
+  Overall, despite the little amount of methods I was able to use to analyze the performance of my models, I believe I produced pretty believable estimates for the proportion of immigrants from different backgrounds in the counties of Norway. There is certainly validity to the forecasting of this data, and I am interested to check back in a few years to see how close these predictions were once the Statistisk sentralbyrå updates their information.
